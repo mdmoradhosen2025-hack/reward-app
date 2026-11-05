@@ -4,7 +4,14 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 
+// Google-এর টেস্ট আইডি। আসল আইডি পরে বসবে।
 const String kTestAdUnitId = 'ca-app-pub-3940256099942544/5224354917';
+
+// ৳ হার: ১০০০ পয়েন্ট = কত টাকা। এটা আপনি AdMob-এর আসল আয় দেখে ঠিক করবেন।
+// ০ থাকলে উইথড্র বন্ধ থাকবে। এখন ইচ্ছে করেই ০ রাখা হয়েছে।
+const int kTakaPer1000Points = 0;
+const int kMinWithdrawPoints = 1000;
+const int kDailyAdLimit = 500;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -125,12 +132,21 @@ class _HomePageState extends State<HomePage> {
   RewardedAd? _ad;
   String _msg = '';
   DateTime? _lastShown;
-  int _adsToday = 0;
+  bool _busy = false;
+
+  String get _uid => FirebaseAuth.instance.currentUser!.uid;
+  DocumentReference<Map<String, dynamic>> get _userRef =>
+      FirebaseFirestore.instance.collection('users').doc(_uid);
 
   @override
   void initState() {
     super.initState();
     _loadAd();
+  }
+
+  String _dayKey() {
+    final n = DateTime.now();
+    return '${n.year}${n.month.toString().padLeft(2, '0')}${n.day.toString().padLeft(2, '0')}';
   }
 
   void _loadAd() {
@@ -139,14 +155,18 @@ class _HomePageState extends State<HomePage> {
       request: const AdRequest(),
       rewardedAdLoadCallback: RewardedAdLoadCallback(
         onAdLoaded: (ad) => setState(() => _ad = ad),
-        onAdFailedToLoad: (err) => setState(() => _msg = 'বিজ্ঞাপন লোড হয়নি। VPN বন্ধ করে চেষ্টা করুন।'),
+        onAdFailedToLoad: (err) =>
+            setState(() => _msg = 'বিজ্ঞাপন লোড হয়নি। VPN বন্ধ করে চেষ্টা করুন।'),
       ),
     );
   }
 
   Future<void> _watchAd() async {
+    if (_busy) return;
+    if (kTakaPer1000Points == 0 && false) return; // পয়েন্ট ব্যবহার আলাদা, বিজ্ঞাপন চালু থাকবে
     if (_ad == null) {
       _loadAd();
+      setState(() => _msg = 'বিজ্ঞাপন প্রস্তুত হচ্ছে, একটু পরে আবার চাপুন।');
       return;
     }
     final now = DateTime.now();
@@ -154,65 +174,140 @@ class _HomePageState extends State<HomePage> {
       setState(() => _msg = 'আরেকটি বিজ্ঞাপনের আগে ৩০ সেকেন্ড অপেক্ষা করুন।');
       return;
     }
-    if (_adsToday >= 500) {
-      setState(() => _msg = 'আজকের সীমা শেষ হয়েছে।');
+
+    // দিনের সীমা যাচাই (ডেটাবেস থেকে)
+    final snap = await _userRef.get();
+    final d = snap.data() ?? {};
+    final sameDay = d['dayKey'] == _dayKey();
+    final todayCount = sameDay ? ((d['adCountToday'] as num?)?.toInt() ?? 0) : 0;
+    if (todayCount >= kDailyAdLimit) {
+      setState(() => _msg = 'আজকের বিজ্ঞাপনের সীমা শেষ হয়েছে।');
       return;
     }
+
     final ad = _ad!;
     _ad = null;
     _lastShown = now;
-    ad.show(onUserEarnedReward: (ad, reward) async {
-      final uid = FirebaseAuth.instance.currentUser!.uid;
-      final ref = FirebaseFirestore.instance.collection('users').doc(uid);
-      final add = _adsToday < 100 ? 10 : (_adsToday < 200 ? 5 : 1);
-      _adsToday++;
-      await ref.update({
-        'points': FieldValue.increment(add),
-        'lastAdAt': FieldValue.serverTimestamp(),
-      });
-      setState(() => _msg = '+$add পয়েন্ট পেয়েছেন');
-    });
     ad.fullScreenContentCallback = FullScreenContentCallback(
-      onAdDismissedFullScreenContent: (ad) {
-        ad.dispose();
+      onAdDismissedFullScreenContent: (a) {
+        a.dispose();
+        _loadAd();
+      },
+      onAdFailedToShowFullScreenContent: (a, e) {
+        a.dispose();
         _loadAd();
       },
     );
+    ad.show(onUserEarnedReward: (a, reward) {
+      _grantReward();
+    });
+  }
+
+  // বিজ্ঞাপন দেখার পুরস্কার: একটি ট্রানজেকশনে পয়েন্ট ও গণনা একসাথে বাড়ে
+  Future<void> _grantReward() async {
+    final today = _dayKey();
+    setState(() => _busy = true);
+    try {
+      final add = await FirebaseFirestore.instance.runTransaction<int>((tx) async {
+        final snap = await tx.get(_userRef);
+        final d = snap.data() ?? {};
+        final sameDay = d['dayKey'] == today;
+        final count = sameDay ? ((d['adCountToday'] as num?)?.toInt() ?? 0) : 0;
+        if (count >= kDailyAdLimit) return -1;
+        final pts = (d['points'] as num?)?.toInt() ?? 0;
+        final add = count < 100 ? 10 : (count < 200 ? 5 : 1);
+        tx.update(_userRef, {
+          'points': pts + add,
+          'adCountToday': count + 1,
+          'dayKey': today,
+          'lastAdAt': FieldValue.serverTimestamp(),
+        });
+        return add;
+      });
+      setState(() => _msg = add < 0
+          ? 'আজকের সীমা শেষ হয়েছে।'
+          : '+$add পয়েন্ট পেয়েছেন');
+    } catch (e) {
+      setState(() => _msg = 'পুরস্কার যাচাই হয়নি। একটু পরে আবার চেষ্টা করুন।');
+    } finally {
+      setState(() => _busy = false);
+    }
   }
 
   Future<void> _withdraw() async {
-    final uid = FirebaseAuth.instance.currentUser!.uid;
-    final number = await showDialog<String>(
-      context: context,
-      builder: (ctx) {
-        final c = TextEditingController();
-        return AlertDialog(
-          title: const Text('বিকাশ/নগদ নম্বর (১১ সংখ্যা)'),
-          content: TextField(controller: c, keyboardType: TextInputType.phone),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('বাতিল')),
-            TextButton(onPressed: () => Navigator.pop(ctx, c.text.trim()), child: const Text('জমা দিন')),
-          ],
-        );
-      },
-    );
-    if (number == null || !RegExp(r'^\d{11}$').hasMatch(number)) {
-      setState(() => _msg = 'সঠিক ১১ সংখ্যার নম্বর দিন।');
+    if (kTakaPer1000Points == 0) {
+      setState(() => _msg = 'উইথড্র এখনো চালু হয়নি।');
       return;
     }
-    await FirebaseFirestore.instance.collection('withdrawals').add({
-      'uid': uid,
-      'number': number,
-      'amount': 100,
-      'status': 'pending',
-      'createdAt': FieldValue.serverTimestamp(),
-    });
-    setState(() => _msg = 'উইথড্র অনুরোধ পাঠানো হয়েছে।');
+    final numCtrl = TextEditingController();
+    final ptsCtrl = TextEditingController();
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('উইথড্র অনুরোধ'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+                controller: numCtrl,
+                keyboardType: TextInputType.phone,
+                decoration: const InputDecoration(labelText: 'বিকাশ/নগদ নম্বর (১১ সংখ্যা)')),
+            TextField(
+                controller: ptsCtrl,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                    labelText: 'পয়েন্ট (সর্বনিম্ন $kMinWithdrawPoints)')),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('বাতিল')),
+          TextButton(
+              onPressed: () => Navigator.pop(
+                  ctx, {'n': numCtrl.text.trim(), 'p': ptsCtrl.text.trim()}),
+              child: const Text('জমা দিন')),
+        ],
+      ),
+    );
+    if (result == null) return;
+
+    final number = result['n'] ?? '';
+    final amount = int.tryParse(result['p'] ?? '') ?? 0;
+    if (!RegExp(r'^01[3-9]\d{8}$').hasMatch(number)) {
+      setState(() => _msg = 'সঠিক ১১ সংখ্যার নম্বর দিন (01 দিয়ে শুরু)।');
+      return;
+    }
+    if (amount < kMinWithdrawPoints) {
+      setState(() => _msg = 'সর্বনিম্ন $kMinWithdrawPoints পয়েন্ট লাগবে।');
+      return;
+    }
+
+    try {
+      final withdrawRef = FirebaseFirestore.instance.collection('withdrawals').doc();
+      final ok = await FirebaseFirestore.instance.runTransaction<bool>((tx) async {
+        final snap = await tx.get(_userRef);
+        final pts = (snap.data()?['points'] as num?)?.toInt() ?? 0;
+        if (pts < amount) return false;
+        // পয়েন্ট কাটা ও অনুরোধ তৈরি একসাথে
+        tx.update(_userRef, {'points': pts - amount});
+        tx.set(withdrawRef, {
+          'uid': _uid,
+          'number': number,
+          'amount': amount,
+          'status': 'pending',
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+        return true;
+      });
+      setState(() => _msg = ok
+          ? 'উইথড্র অনুরোধ পাঠানো হয়েছে। অনুমোদনের পর টাকা পাঠানো হবে।'
+          : 'আপনার পয়েন্ট যথেষ্ট নেই।');
+    } catch (e) {
+      setState(() => _msg = 'উইথড্র অনুরোধ পাঠানো যায়নি। আবার চেষ্টা করুন।');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final uid = FirebaseAuth.instance.currentUser!.uid;
     return Scaffold(
       appBar: AppBar(
         title: const Text('রিওয়ার্ড অ্যাপ'),
@@ -226,10 +321,10 @@ class _HomePageState extends State<HomePage> {
         padding: const EdgeInsets.all(20),
         child: Column(
           children: [
-            StreamBuilder<DocumentSnapshot>(
-              stream: FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
+            StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+              stream: _userRef.snapshots(),
               builder: (context, snap) {
-                final pts = (snap.data?.data() as Map<String, dynamic>?)?['points'] ?? 0;
+                final pts = (snap.data?.data()?['points'] as num?)?.toInt() ?? 0;
                 return Text('আপনার পয়েন্ট: $pts',
                     style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold));
               },
@@ -239,7 +334,7 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(height: 12),
             OutlinedButton(onPressed: _withdraw, child: const Text('উইথড্র অনুরোধ')),
             const SizedBox(height: 16),
-            Text(_msg),
+            Text(_msg, textAlign: TextAlign.center),
           ],
         ),
       ),
