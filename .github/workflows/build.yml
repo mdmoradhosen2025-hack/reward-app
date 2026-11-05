@@ -19,15 +19,13 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.3'
+          flutter-version: '3.24.5'
           channel: stable
 
       - name: Create Android project files
         run: |
-          flutter create --org com.rewardapp --project-name reward_app --platforms=android _gen
-          mv _gen/android ./android
-          rm -rf _gen
-
+          flutter create --org com.rewardapp --project-name reward_app --platforms=android .
+          
       - name: Add AdMob test App ID and permissions
         run: |
           python3 - <<'EOF'
