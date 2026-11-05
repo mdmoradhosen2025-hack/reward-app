@@ -22,10 +22,12 @@ jobs:
           flutter-version: '3.24.5'
           channel: stable
 
-      - name: Create Android project files
+      - name: Create Flutter project files
         run: |
-          flutter create --org com.rewardapp --project-name reward_app --platforms=android .
-          
+          flutter create --org com.rewardapp --project-name reward_app --platforms=android _tmp
+          cp -r _tmp/android ./android
+          rm -rf _tmp
+
       - name: Add AdMob test App ID and permissions
         run: |
           python3 - <<'EOF'
