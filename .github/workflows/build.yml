@@ -40,10 +40,20 @@ jobs:
           open(p, "w", encoding="utf-8").write(s)
           EOF
 
-      - name: Set minimum Android version
+      - name: Set minimum Android version to 23
         run: |
-          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts 2>/dev/null || true
-          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle 2>/dev/null || true
+          python3 - <<'EOF'
+          import re
+          for p in ["android/app/build.gradle.kts", "android/app/build.gradle"]:
+              try:
+                  s = open(p, encoding="utf-8").read()
+              except FileNotFoundError:
+                  continue
+              s = re.sub(r'minSdk\s*=\s*[^\n]*', 'minSdk = 23', s)
+              s = re.sub(r'minSdkVersion\s+[^\n]*', 'minSdkVersion 23', s)
+              open(p, "w", encoding="utf-8").write(s)
+              print("patched", p)
+          EOF
 
       - name: Get packages
         run: flutter pub get
